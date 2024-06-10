@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
+  build:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -36,12 +36,58 @@ jobs:
       - run: sudo snap install --edge --classic just
       - uses: actions/checkout@v4
 
+      - name: Migrate database
+        run: |
+          sudo apt-get install libpq-dev -y
+          cargo install --version=0.7.4 sqlx-cli --no-default-features --features postgres
+          cd crates/iceberg-rest-server
+          sqlx database create
+          sqlx migrate run
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+      - name: Build Project
+        run: cargo build --release
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+      - name: Save Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: target/release/
+  
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    needs: build
+    steps:
+      - run: sudo snap install --edge --classic just
+      - uses: actions/checkout@v4
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+
       - name: Cargo format
         run: just check-format
 
       - name: Check diff
         run: git diff --exit-code
-
+  
   docker:
     runs-on: ubuntu-24.04
     services:
@@ -114,7 +160,7 @@ jobs:
         with:
           name: iceberg-rest-server-image
           path: /tmp/*.tar
-
+          
   clippy:
     runs-on: ubuntu-latest
     services:
@@ -131,19 +177,14 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
+    needs: build
     steps:
       - run: sudo snap install --edge --classic just
       - uses: actions/checkout@v4
-
-      - name: Migrate database
-        run: |
-          sudo apt-get install libpq-dev -y
-          cargo install --version=0.7.4 sqlx-cli --no-default-features --features postgres
-          cd crates/iceberg-rest-server
-          sqlx database create
-          sqlx migrate run
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
 
       - name: Cargo clippy
         run: just check-clippy
@@ -166,18 +207,13 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
+    needs: build
     steps:
       - uses: actions/checkout@v4
-
-      - name: Migrate database
-        run: |
-          sudo apt-get install libpq-dev -y
-          cargo install --version=0.7.4 sqlx-cli --no-default-features --features postgres
-          cd crates/iceberg-rest-server
-          sqlx database create
-          sqlx migrate run
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
 
       - name: Test
         run: cargo test --no-fail-fast --all-targets --all-features --workspace
@@ -217,7 +253,6 @@ jobs:
           ICEBERG_REST_TEST_SPARK_IMAGE: apache/spark:3.5.1-java17-python3
           ICEBERG_REST_TEST_SERVER_IMAGE: localhost/iceberg-rest-local:amd64
 
-
   test-pyspark:
     needs: docker
     runs-on: ubuntu-latest
@@ -233,15 +268,4 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -Rlh artifacts
     
-      - name: Restore Docker image
-        run: |
-          docker load -i artifacts/iceberg-rest-server-amd64.tar
-
-      - name: Test Pyspark
-        run: |
-          cd tests &&
-          docker compose run spark /opt/entrypoint.sh bash -c "cd /opt/tests && bash run_spark.sh"
-
-        env:
-          ICEBERG_REST_TEST_SPARK_IMAGE: apache/spark:3.5.1-java17-python3
-          ICEBERG_REST_TEST_SERVER_IMAGE: localhost/iceberg-rest-local:amd64
+      - name: Restore
