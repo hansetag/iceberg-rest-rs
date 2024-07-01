@@ -1,28 +1,29 @@
 mod load;
 
-use crate::implementations::postgres::dbutils::DBErrorHandler as _;
+use crate::implementations::postgres::{dbutils::DBErrorHandler as _, tabular, CatalogState};
 use crate::{
     service::{ErrorModel, NamespaceIdentUuid, Result, TableIdent, TableIdentUuid},
     WarehouseIdent,
 };
 
 use http::StatusCode;
+use iceberg_ext::NamespaceIdent;
 
 use crate::implementations::postgres::tabular::{
-    create_tabular, list_tabulars, CreateTabular, TabularIdentRef, TabularIdentUuid, TabularType,
+    create_tabular, drop_tabular, list_tabulars, CreateTabular, TabularIdentRef, TabularIdentUuid,
+    TabularType,
 };
 use chrono::{DateTime, Utc};
 use iceberg::spec::{SchemaRef, ViewMetadata, ViewRepresentation, ViewVersion, ViewVersionRef};
-use iceberg::NamespaceIdent;
 use iceberg_ext::catalog::rest::{CreateViewRequest, IcebergErrorResponse};
 use maplit::hashmap;
 use sqlx::{FromRow, Postgres, Transaction};
 use std::collections::HashMap;
 use std::default::Default;
 use std::sync::Arc;
+use tracing::instrument;
 use uuid::Uuid;
 
-use crate::implementations::postgres::CatalogState;
 pub(crate) use load::load_view;
 
 pub(crate) async fn view_ident_to_id<'e, 'c: 'e, E>(
@@ -54,16 +55,18 @@ where
 
 pub(crate) enum CreateViewVersion {
     AsCurrent(ViewVersionRef),
+    Append(ViewVersionRef),
 }
 
 impl CreateViewVersion {
     fn inner(&self) -> &ViewVersion {
         match self {
-            Self::AsCurrent(v) => v.as_ref(),
+            Self::Append(v) | Self::AsCurrent(v) => v.as_ref(),
         }
     }
 }
 
+#[instrument(skip(transaction))]
 pub(crate) async fn create_view(
     namespace_id: &NamespaceIdentUuid,
     view: &TableIdent,
@@ -234,6 +237,34 @@ pub(crate) async fn insert_view_properties(
     Ok(())
 }
 
+pub(crate) async fn delete_properties(
+    view_id: Uuid,
+    removals: &[String],
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), IcebergErrorResponse> {
+    let placeholders: Vec<String> = (1..=removals.len())
+        .map(|i| format!("${}", i + 1))
+        .collect();
+    let sql = format!(
+        r#"
+        DELETE FROM view_properties
+        WHERE view_id = $1 AND key IN ({})
+        "#,
+        placeholders.join(", ")
+    );
+
+    let mut q = sqlx::query(&sql).bind(view_id);
+    for r in removals {
+        q = q.bind(r);
+    }
+    q.execute(&mut **transaction).await.map_err(|e| {
+        let message = "Error deleting view properties".to_string();
+        tracing::warn!("{}", message);
+        e.into_error_model(message)
+    })?;
+    Ok(())
+}
+
 pub(crate) async fn create_view_schema(
     view_id: Uuid,
     schema: SchemaRef,
@@ -272,9 +303,9 @@ pub(crate) async fn create_view_schema(
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, FromRow)]
-pub(crate) struct ViewVersionResponse {
-    pub(crate) version_id: i64,
-    pub(crate) view_version_uuid: Uuid,
+pub struct ViewVersionResponse {
+    pub version_id: i64,
+    pub view_version_uuid: Uuid,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -368,7 +399,9 @@ pub(crate) async fn create_view_version(
         insert_representation(rep, transaction, insert_response.view_version_uuid).await?;
     }
 
-    let CreateViewVersion::AsCurrent(_) = view_version_request;
+    let CreateViewVersion::AsCurrent(_) = view_version_request else {
+        return Ok(insert_response);
+    };
 
     set_current_view_metadata_version(version_id, view_id, transaction).await?;
 
@@ -426,6 +459,19 @@ pub(crate) async fn set_current_view_metadata_version(
     Ok(())
 }
 
+pub(crate) async fn update_metadata_location(
+    view_id: Uuid,
+    metadata_location: &str,
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), IcebergErrorResponse> {
+    tabular::update_metadata_location(
+        TabularIdentUuid::View(view_id),
+        metadata_location,
+        transaction,
+    )
+    .await
+}
+
 pub(crate) async fn list_views(
     warehouse_id: &WarehouseIdent,
     namespace: &NamespaceIdent,
@@ -450,6 +496,67 @@ pub(crate) async fn list_views(
         TabularIdentUuid::View(t) => Ok((TableIdentUuid::from(t), v.into_inner())),
     })
     .collect::<Result<HashMap<TableIdentUuid, TableIdent>>>()
+}
+
+/// Rename a table. Tables may be moved across namespaces.
+pub(crate) async fn rename_view(
+    warehouse_id: &WarehouseIdent,
+    source_id: &TableIdentUuid,
+    source: &TableIdent,
+    destination: &TableIdent,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    crate::implementations::postgres::tabular::rename_tabular(
+        warehouse_id,
+        TabularIdentUuid::View(source_id.into_uuid()),
+        source,
+        destination,
+        transaction,
+    )
+    .await?;
+
+    Ok(())
+}
+
+pub(crate) async fn drop_view<'a>(
+    whi: &WarehouseIdent,
+    table_id: &TableIdentUuid,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    let _ = sqlx::query!(
+        r#"
+        DELETE FROM view
+        WHERE view_id = $1
+        AND view_id IN (
+            select tabular_id from active_tabulars
+            where tabular_id = $1
+        )
+        RETURNING "view_id"
+        "#,
+        table_id.as_uuid(),
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::RowNotFound = e {
+            ErrorModel::builder()
+                .code(StatusCode::NOT_FOUND.into())
+                .message("View not found".to_string())
+                .r#type("NoSuchViewError".to_string())
+                .build()
+        } else {
+            tracing::warn!("Error dropping view: {}", e);
+            e.into_error_model("Error dropping view".to_string())
+        }
+    })?;
+
+    drop_tabular(
+        whi,
+        TabularIdentUuid::View(*table_id.as_uuid()),
+        transaction,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn insert_representation(
@@ -641,5 +748,61 @@ pub(crate) mod tests {
         let mut conn = state.read_pool.acquire().await.unwrap();
         let metadata = load_view(&view_id, &mut conn).await.unwrap();
         assert_eq!(metadata, created_meta);
+    }
+
+    #[sqlx::test]
+    async fn test_drop_view(pool: sqlx::PgPool) {
+        let state = CatalogState {
+            read_pool: pool.clone(),
+            write_pool: pool.clone(),
+        };
+        let warehouse_id = initialize_warehouse(state.clone(), None, None).await;
+        let namespace = NamespaceIdent::from_vec(vec!["my_namespace".to_string()]).unwrap();
+        initialize_namespace(state.clone(), &warehouse_id, &namespace, None).await;
+        let namespace_id =
+            crate::implementations::postgres::tabular::table::tests::get_namespace_id(
+                state.clone(),
+                &warehouse_id,
+                &namespace,
+            )
+            .await;
+
+        let request = view_request();
+        let table_uuid = Uuid::now_v7().into();
+        let mut tx = pool.begin().await.unwrap();
+        let _ = super::create_view(
+            &namespace_id,
+            &TableIdent {
+                namespace: namespace.clone(),
+                name: request.name.clone(),
+            },
+            table_uuid,
+            request.clone(),
+            "s3://my_bucket/my_table/metadata/bar",
+            &mut tx,
+        )
+        .await
+        .unwrap();
+
+        tx.commit().await.unwrap();
+
+        let views = super::list_views(&warehouse_id, &namespace, state.clone())
+            .await
+            .unwrap();
+        assert_eq!(views.len(), 1);
+        let (view_id, view) = views.into_iter().next().unwrap();
+        assert_eq!(view_id, table_uuid);
+        assert_eq!(view.name, "myview");
+        let mut tx = pool.begin().await.unwrap();
+
+        super::drop_view(&warehouse_id, &table_uuid, &mut tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let views = super::list_views(&warehouse_id, &namespace, state.clone())
+            .await
+            .unwrap();
+        assert_eq!(views.len(), 0);
     }
 }

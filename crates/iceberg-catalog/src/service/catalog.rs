@@ -1,4 +1,4 @@
-use iceberg::spec::{TableMetadata, ViewMetadata};
+use iceberg::spec::{SchemaRef, TableMetadata, ViewMetadata, ViewVersionRef};
 use iceberg_ext::catalog::rest::CreateViewRequest;
 pub use iceberg_ext::catalog::rest::{
     CommitTableResponse, CommitTransactionRequest, CreateTableRequest,
@@ -16,6 +16,7 @@ pub use crate::api::iceberg::v1::{
     NamespaceIdent, Result, TableIdent, UpdateNamespacePropertiesRequest,
     UpdateNamespacePropertiesResponse,
 };
+use crate::implementations::postgres::tabular::view::ViewVersionResponse;
 use crate::service::tabular_idents::TabularIdentUuid;
 
 #[async_trait::async_trait]
@@ -309,7 +310,7 @@ where
     /// If include_staged is true, also return staged tables.
     /// If the table does not exist, return Ok(None).
     ///
-    /// We use this function also to handle the `view_exists` endpoint.
+    /// We use this function also to handle the `table_exists` endpoint.
     /// Also return Ok(None) if the warehouse is not active.
     async fn view_ident_to_id(
         warehouse_id: &WarehouseIdent,
@@ -337,4 +338,57 @@ where
         namespace: &NamespaceIdent,
         catalog_state: Self::State,
     ) -> Result<HashMap<TableIdentUuid, TableIdent>>;
+
+    /// Drop a view.
+    ///
+    /// Consider in your implementation to implement an UNDROP feature.
+    async fn drop_view<'a>(
+        warehouse_id: &WarehouseIdent,
+        table_id: &TableIdentUuid,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<()>;
+
+    async fn add_view_schema(
+        view_id: &TableIdentUuid,
+        schema: SchemaRef,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> Result<i32>;
+
+    async fn insert_view_properties(
+        view_id: &TableIdentUuid,
+        properties: &HashMap<String, String>,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> Result<()>;
+
+    async fn delete_view_properties(
+        view_id: &TableIdentUuid,
+        keys: &[String],
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> Result<()>;
+
+    async fn create_view_version<'a>(
+        view_id: &TableIdentUuid,
+        view_version_ref: ViewVersionRef,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<ViewVersionResponse>;
+
+    async fn set_current_view_version<'a>(
+        view_id: &TableIdentUuid,
+        view_version_ref: i64,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<()>;
+
+    async fn update_view_metadata_location(
+        table_id: &TableIdentUuid,
+        metadata_location: &str,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> Result<()>;
+
+    async fn rename_view(
+        warehouse_id: &WarehouseIdent,
+        source_id: &TableIdentUuid,
+        source: &TableIdent,
+        destination: &TableIdent,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> Result<()>;
 }

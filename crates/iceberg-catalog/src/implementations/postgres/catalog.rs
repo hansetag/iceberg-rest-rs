@@ -1,6 +1,6 @@
-use iceberg::spec::ViewMetadata;
-use iceberg_ext::catalog::rest::CreateViewRequest;
+use iceberg::spec::{SchemaRef, ViewMetadata, ViewVersionRef};
 use std::collections::{HashMap, HashSet};
+use iceberg_ext::catalog::rest::CreateViewRequest;
 
 use super::{
     namespace::{
@@ -19,9 +19,12 @@ use super::{
     CatalogState, PostgresTransaction,
 };
 use crate::implementations::postgres::tabular::view::{
-    create_view, list_views, load_view, view_ident_to_id,
+    create_view, create_view_schema, create_view_version, delete_properties, drop_view,
+    insert_view_properties, list_views, load_view, rename_view, set_current_view_metadata_version,
+    update_metadata_location, view_ident_to_id, CreateViewVersion, ViewVersionResponse,
 };
 use crate::service::tabular_idents::TabularIdentUuid;
+
 use crate::service::{
     CommitTransactionRequest, CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest,
     GetWarehouseResponse, ListNamespacesQuery, ListNamespacesResponse, NamespaceIdent, Result,
@@ -314,6 +317,14 @@ impl Catalog for super::Catalog {
         view_ident_to_id(warehouse_id, view, &catalog_state.read_pool).await
     }
 
+    async fn drop_view<'a>(
+        warehouse_id: &WarehouseIdent,
+        table_id: &TableIdentUuid,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<()> {
+        drop_view(warehouse_id, table_id, transaction).await
+    }
+
     async fn load_view<'a>(
         view_id: TableIdentUuid,
         transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
@@ -327,5 +338,68 @@ impl Catalog for super::Catalog {
         catalog_state: Self::State,
     ) -> Result<HashMap<TableIdentUuid, TableIdent>> {
         list_views(warehouse_id, namespace, catalog_state).await
+    }
+
+    async fn add_view_schema(
+        view_id: &TableIdentUuid,
+        schema: SchemaRef,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> Result<i32> {
+        create_view_schema(view_id.into_uuid(), schema, transaction).await
+    }
+
+    async fn insert_view_properties(
+        view_id: &TableIdentUuid,
+        properties: &HashMap<String, String>,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> Result<()> {
+        insert_view_properties(properties, view_id.into_uuid(), transaction).await
+    }
+
+    async fn delete_view_properties(
+        view_id: &TableIdentUuid,
+        keys: &[String],
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> Result<()> {
+        delete_properties(view_id.into_uuid(), keys, transaction).await
+    }
+
+    async fn create_view_version<'a>(
+        view_id: &TableIdentUuid,
+        view_version_ref: ViewVersionRef,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<ViewVersionResponse> {
+        create_view_version(
+            view_id.into_uuid(),
+            CreateViewVersion::Append(view_version_ref),
+            transaction,
+        )
+        .await
+    }
+
+    async fn set_current_view_version<'a>(
+        view_id: &TableIdentUuid,
+        version_id: i64,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<()> {
+        set_current_view_metadata_version(version_id, view_id.into_uuid(), transaction).await
+    }
+
+    async fn update_view_metadata_location(
+        table_id: &TableIdentUuid,
+        metadata_location: &str,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> Result<()> {
+        update_metadata_location(table_id.into_uuid(), metadata_location, transaction).await
+    }
+
+    async fn rename_view(
+        warehouse_id: &WarehouseIdent,
+        source_id: &TableIdentUuid,
+        source: &TableIdent,
+        destination: &TableIdent,
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+    ) -> Result<()> {
+        rename_view(warehouse_id, source_id, source, destination, transaction).await
     }
 }
